@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # License: GPLv3 Copyright: 2026, Kovid Goyal <kovid at kovidgoyal.net>
 
-from collections.abc import Container, Mapping
 from html import escape
+from typing import TYPE_CHECKING
 
 from qt.core import (
     QAction,
@@ -36,12 +36,16 @@ from qt.core import (
     pyqtSignal,
 )
 
-from calibre.ai.cyoa import GameState
 from calibre.ai.utils import ContentType, response_to_html
 from calibre.gui2.cyoa.text_display import TextDisplayMixin
 from calibre.gui2.momentum_scroll import MomentumScrollMixin
 from calibre.utils.localization import _
 from calibre.utils.resources import get_image_path
+
+if TYPE_CHECKING:
+    from collections.abc import Container, Mapping
+
+    from calibre.ai.cyoa import GameState
 
 # The ornamental divider drawn between the turns of a chapter, rendered from
 # imgsrc/scene-divider.svg at twice its display width so it stays crisp on
@@ -238,7 +242,7 @@ class StoryView(TextDisplayMixin, MomentumScrollMixin, QTextBrowser):
         self.edit_turn_action: QAction | None = None
         self.setup_text_display()
 
-    def wheelEvent(self, a0: QWheelEvent | None) -> None:  # ty: ignore[invalid-method-override]
+    def wheelEvent(self, a0: QWheelEvent | None) -> None:  # ty: ignore[lost-keyword-for-regular-parameter]
         if not self.zoom_wheel_event(a0):
             MomentumScrollMixin.wheelEvent(self, a0)
 

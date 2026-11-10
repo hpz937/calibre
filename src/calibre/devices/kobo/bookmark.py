@@ -1,8 +1,18 @@
 # License: GPLv3 Copyright: 2011, Timothy Legge <timlegge@gmail.com> and Kovid Goyal <kovid@kovidgoyal.net>
 
 import os
+from typing import TYPE_CHECKING, TypedDict
 
+from calibre.devices.kobo import bool_match
 from calibre.prints import debug_print
+
+if TYPE_CHECKING:
+    import apsw
+
+
+class KepubChapter(TypedDict):
+    chapter_title: str | None
+    chapter_index: int
 
 
 class Bookmark:  # {{{
@@ -11,16 +21,16 @@ class Bookmark:  # {{{
     kobo-specific
     """
 
-    def __init__(self, db_connection, contentId, path, id, book_format, bookmark_extension):
+    def __init__(self, db_connection: apsw.Connection, contentId: str, path: str, id: int, book_format: str, bookmark_extension: str) -> None:
         self.book_format = book_format
         self.bookmark_extension = bookmark_extension
         self.book_length = 0  # Not Used
         self.id = id
-        self.last_read = 0
+        self.last_read: str | int | None = 0
         self.last_read_location = 0  # Not Used
         self.path = path
-        self.timestamp = 0
-        self.user_notes = None
+        self.timestamp: float = 0
+        self.user_notes: dict[int, dict[str, object]] | None = None
         self.db_connection = db_connection
         self.contentId = contentId
         self.percent_read = 0
@@ -28,9 +38,9 @@ class Bookmark:  # {{{
         self.get_bookmark_data()
         self.get_book_length()  # Not Used
 
-    def get_bookmark_data(self):
+    def get_bookmark_data(self) -> None:
         """Return the timestamp and last_read_location"""
-        user_notes = {}
+        user_notes: dict[int, dict[str, object]] = {}
         self.timestamp = os.path.getmtime(self.path)
 
         cursor = self.db_connection.cursor()
@@ -48,13 +58,13 @@ class Bookmark:  # {{{
             'bm.ChapterProgress, bm.StartContainerChildIndex, bm.StartOffset, '
             'c.BookTitle, c.Title, c.volumeIndex, c.MimeType '
             'FROM Bookmark bm LEFT OUTER JOIN Content c ON c.ContentID = bm.ContentID '
-            'WHERE bm.Hidden = "false" AND bm.volumeid = ? '
+            f"WHERE {bool_match('bm.Hidden', False)} AND bm.volumeid = ? "
             'ORDER BY bm.ContentID, bm.chapterprogress'
         )
 
         debug_print(f'Kobo::Bookmark::get_bookmark_data - getting kepub chapters: contentId={self.contentId}')
         cursor.execute(kepub_chapter_query, book_query_values)
-        kepub_chapters = {}
+        kepub_chapters: dict[str, KepubChapter] = {}
         if self.kepub:
             try:
                 for chapter_row in cursor:
@@ -157,19 +167,19 @@ class Bookmark:  # {{{
         # self.last_read_location = self.last_read - self.pdf_page_offset
         self.user_notes = user_notes
 
-    def get_book_length(self):
+    def get_book_length(self) -> None:
         # TL        self.book_length = 0
         # TL        self.book_length = int(unpack('>I', record0[0x04:0x08])[0])
         pass
 
-    def __str__(self):
+    def __str__(self) -> str:
         """
         A string representation of this object, suitable for printing to
         console
         """
         parts = ['Kobo bookmark:']
 
-        def fmt(x, y):
+        def fmt(x: str, y: object) -> None:
             parts.append(f'{x:<20}: {y}')
 
         if self.contentId:

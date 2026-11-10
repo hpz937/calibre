@@ -8,6 +8,7 @@ import subprocess
 import time
 from collections import namedtuple
 from http.cookiejar import CookieJar
+from typing import TYPE_CHECKING
 from urllib.error import HTTPError
 from urllib.request import HTTPBasicAuthHandler, HTTPCookieProcessor, HTTPDigestAuthHandler, build_opener
 
@@ -16,39 +17,54 @@ from calibre.ptempfile import TemporaryDirectory
 from calibre.srv.errors import HTTPForbidden
 from calibre.srv.routes import Router, endpoint
 from calibre.srv.tests.base import BaseTest, TestServer
-from polyglot.binary import as_base64_bytes
+from polyglot.binary import as_base64_bytes, as_hex_unicode
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from calibre.srv.auth import DigestAuth
+    from calibre.srv.handler import Context
+    from calibre.srv.http_response import RequestData
 
 REALM = 'calibre-test'
+# Stored passwords are NFC normalized
+UNICODE_PW = 'Example-Server-2026\xe5 \u66f8\xe9'
+LATIN_PW = 'p\xe4ssw\xf6rd'
 is_ci = os.environ.get('CI', '').lower() == 'true'
 
 
 @endpoint('/open', auth_required=False)
-def noauth(ctx, data):
+def noauth(ctx: Context, data: RequestData) -> str:
     return 'open'
 
 
 @endpoint('/closed', auth_required=True)
-def auth(ctx, data):
+def auth(ctx: Context, data: RequestData) -> str:
     return 'closed'
 
 
 @endpoint('/android', auth_required=True, android_workaround=True)
-def android(ctx, data):
+def android(ctx: Context, data: RequestData) -> str:
     return 'android'
 
 
 @endpoint('/android2', auth_required=True, android_workaround=True)
-def android2(ctx, data):
+def android2(ctx: Context, data: RequestData) -> str:
     return 'android2'
 
 
-def router(prefer_basic_auth=False, ban_for=0, ban_after=5):
+@endpoint('/android-user', auth_required=True, android_workaround=True)
+def android_user(ctx: Context, data: RequestData) -> str:
+    return f'user:{data.username}'
+
+
+def router(prefer_basic_auth: bool = False, ban_for: float = 0, ban_after: int = 5) -> Router:
     from calibre.srv.auth import AuthController
 
     return Router(
         globals().values(),
         auth_controller=AuthController(
-            {'testuser': 'testpw', '!@#$%^&*()-=_+': '!@#$%^&*()-=_+'},
+            {'testuser': 'testpw', '!@#$%^&*()-=_+': '!@#$%^&*()-=_+', 'unicode': UNICODE_PW, 'latin': LATIN_PW},
             ban_time_in_minutes=ban_for,
             ban_after=ban_after,
             prefer_basic_auth=prefer_basic_auth,
@@ -58,7 +74,7 @@ def router(prefer_basic_auth=False, ban_for=0, ban_after=5):
     )
 
 
-def urlopen(server, path='/closed', un='testuser', pw='testpw', method='digest'):
+def urlopen(server: TestServer, path: str = '/closed', un: str = 'testuser', pw: str = 'testpw', method: str = 'digest') -> http.client.HTTPResponse:
     auth_handler = HTTPBasicAuthHandler() if method == 'basic' else HTTPDigestAuthHandler()
     url = f'http://localhost:{server.address[1]}{path}'
     auth_handler.add_password(realm=REALM, uri=url, user=un, passwd=pw)
@@ -66,19 +82,19 @@ def urlopen(server, path='/closed', un='testuser', pw='testpw', method='digest')
 
 
 def digest(
-    un,
-    pw,
-    nonce=None,
-    uri=None,
-    method='GET',
-    nc=1,
-    qop='auth',
-    realm=REALM,
-    cnonce=None,
-    algorithm='MD5',
-    body=b'',
-    modify=lambda x: None,
-):
+    un: str,
+    pw: str,
+    nonce: str | None = None,
+    uri: str | None = None,
+    method: str = 'GET',
+    nc: int = 1,
+    qop: str = 'auth',
+    realm: str = REALM,
+    cnonce: str | None = None,
+    algorithm: str = 'MD5',
+    body: bytes = b'',
+    modify: Callable[[DigestAuth], object] = lambda x: None,
+) -> bytes:
     "Create the payload for a digest based Authorization header"
     from calibre.srv.auth import DigestAuth
 
@@ -103,10 +119,10 @@ def digest(
     pw = getattr(da, 'pw', pw)
 
     class Data:
-        def __init__(self):
+        def __init__(self) -> None:
             self.method = method
 
-        def peek(self):
+        def peek(self) -> bytes:
             return body
 
     response = da.request_digest(pw, Data())
@@ -128,7 +144,7 @@ def digest(
 
 
 class TestAuth(BaseTest):
-    def test_basic_auth(self):  # {{{
+    def test_basic_auth(self) -> None:  # {{{
         "Test HTTP Basic auth"
         r = router(prefer_basic_auth=True)
         with TestServer(r.dispatch) as server:
@@ -142,7 +158,7 @@ class TestAuth(BaseTest):
             conn.request('GET', '/closed')
             r = conn.getresponse()
             self.ae(r.status, http.client.UNAUTHORIZED)
-            self.ae(r.getheader('WWW-Authenticate'), f'Basic realm="{REALM}"')
+            self.ae(r.getheader('WWW-Authenticate'), f'Basic realm="{REALM}", charset="UTF-8"')
             self.assertFalse(r.read())
             conn.request('GET', '/closed', headers={'Authorization': b'Basic ' + as_base64_bytes(b'testuser:testpw')})
             r = conn.getresponse()
@@ -151,7 +167,7 @@ class TestAuth(BaseTest):
             self.ae(b'closed', urlopen(server, method='basic').read())
             self.ae(b'closed', urlopen(server, un='!@#$%^&*()-=_+', pw='!@#$%^&*()-=_+', method='basic').read())
 
-            def request(un='testuser', pw='testpw'):
+            def request(un: str = 'testuser', pw: str = 'testpw') -> tuple[int, bytes]:
                 conn.request('GET', '/closed', headers={'Authorization': b'Basic ' + as_base64_bytes(f'{un}:{pw}')})
                 r = conn.getresponse()
                 return r.status, r.read()
@@ -169,7 +185,102 @@ class TestAuth(BaseTest):
 
     # }}}
 
-    def test_library_restrictions(self):  # {{{
+    def test_non_ascii_passwords(self) -> None:  # {{{
+        "Test logging in with passwords containing non-ASCII characters"
+        import unicodedata
+        from hashlib import md5
+
+        from calibre.srv.utils import parse_http_dict
+
+        def basic(raw: bytes) -> dict[str, bytes]:
+            return {'Authorization': b'Basic ' + as_base64_bytes(raw)}
+
+        r = router(prefer_basic_auth=True)
+        with TestServer(r.dispatch) as server:
+            conn = server.connect()
+
+            def request(headers: dict[str, bytes]) -> tuple[int, bytes]:
+                conn.request('GET', '/closed', headers=headers)
+                r = conn.getresponse()
+                return r.status, r.read()
+
+            ok = (http.client.OK, b'closed')
+            self.ae(ok, request(basic(f'unicode:{UNICODE_PW}'.encode())))
+            self.ae(b'closed', urlopen(server, un='unicode', pw=UNICODE_PW, method='basic').read())
+            # Decomposed input matches the precomposed stored password
+            nfd = unicodedata.normalize('NFD', UNICODE_PW)
+            self.assertNotEqual(nfd, UNICODE_PW)
+            self.ae(ok, request(basic(f'unicode:{nfd}'.encode())))
+            # Clients that use ISO-8859-1 for Basic auth
+            self.ae(ok, request(basic(f'latin:{LATIN_PW}'.encode('iso-8859-1'))))
+            self.ae(ok, request(basic(f'latin:{LATIN_PW}'.encode())))
+            self.ae(http.client.UNAUTHORIZED, request(basic(f'unicode:{UNICODE_PW}'.encode('utf-16')))[0])
+            self.ae(http.client.UNAUTHORIZED, request(basic(b'unicode:' + UNICODE_PW[:-1].encode()))[0])
+            st, body = request({'Authorization': b'Basic not-base64!'})
+            self.ae((http.client.BAD_REQUEST, b'The Basic authorization credentials were not valid base64'), (st, body))
+            st, body = request({'Authorization': 'Basic \xe5'.encode()})
+            self.ae(http.client.BAD_REQUEST, st)
+
+        r = router()
+        with TestServer(r.dispatch) as server:
+            conn = server.connect()
+
+            def digest_request(un: str, pw: str) -> int:
+                # Compute the response independently of the server code, the
+                # way browsers do, using UTF-8
+                conn.request('GET', '/closed')
+                r = conn.getresponse()
+                r.read()
+                chal = parse_http_dict(r.getheader('WWW-Authenticate').partition(' ')[2])
+                nonce, cnonce, nc = chal['nonce'], 'abcdef', '00000001'
+
+                def h(x: str) -> str:
+                    return md5(x.encode('utf-8')).hexdigest()
+
+                response = h(f"{h(f'{un}:{REALM}:{pw}')}:{nonce}:{nc}:{cnonce}:auth:{h('GET:/closed')}")
+                auth = (
+                    f'Digest username="{un}", realm="{REALM}", nonce="{nonce}", uri="/closed", algorithm=MD5,'
+                    f' response="{response}", qop=auth, nc={nc}, cnonce="{cnonce}"'
+                )
+                conn.request('GET', '/closed', headers={'Authorization': auth.encode('ascii')})
+                r = conn.getresponse()
+                r.read()
+                return r.status
+
+            self.ae(http.client.OK, digest_request('unicode', UNICODE_PW))
+            self.ae(http.client.OK, digest_request('latin', LATIN_PW))
+            self.ae(http.client.UNAUTHORIZED, digest_request('unicode', UNICODE_PW[:-1]))
+
+    # }}}
+
+    def test_password_validation(self) -> None:  # {{{
+        "Test validation and normalization of stored passwords"
+        import unicodedata
+
+        from calibre.srv.users import UserManager, validate_password
+
+        for pw in ('testpw', UNICODE_PW, LATIN_PW, 'a b', 'emoji \U0001f600', '\u0627\u0644\u0639\u0631\u0628\u064a\u0629'):
+            self.assertIsNone(validate_password(pw), repr(pw))
+        for pw in ('', 'a\nb', 'a\tb', 'a\x00b', 'a\x7fb', 'a\u200bb', 'a\u2028b', 'a\ud800b'):
+            self.assertIsNotNone(validate_password(pw), repr(pw))
+
+        nfd = unicodedata.normalize('NFD', UNICODE_PW)
+        with TemporaryDirectory() as tdir:
+            m = UserManager(os.path.join(tdir, 'users.sqlite'))
+            m.add_user('a', nfd)
+            self.ae(m.get('a'), UNICODE_PW)
+            m.change_password('a', 'x' + nfd)
+            self.ae(m.get('a'), 'x' + UNICODE_PW)
+            self.assertRaises(ValueError, m.change_password, 'a', 'a\nb')
+            ud = m.user_data
+            ud['a']['pw'] = 'y' + nfd
+            m.user_data = ud
+            self.ae(m.get('a'), 'y' + UNICODE_PW)
+            m.conn.close()
+
+    # }}}
+
+    def test_library_restrictions(self) -> None:  # {{{
         from calibre.db.legacy import create_backend
         from calibre.srv.handler import Handler
         from calibre.srv.opts import Options
@@ -183,11 +294,11 @@ class TestAuth(BaseTest):
             ctx = Handler((l1, l2, l3), opts).router.ctx
             um = ctx.user_manager
 
-            def get_library(username=None, library_id=None):
+            def get_library(username: str | None = None, library_id: str | None = None) -> str:
                 ans = ctx.get_library(Data(username), library_id=library_id)
                 return os.path.basename(ans.backend.library_path)
 
-            def library_info(username=None):
+            def library_info(username: str | None = None) -> tuple[dict[str, str], str]:
                 lmap, defaultlib = ctx.library_info(Data(username))
                 lmap = {k: os.path.basename(v) for k, v in lmap.items()}
                 return lmap, defaultlib
@@ -208,7 +319,7 @@ class TestAuth(BaseTest):
 
     # }}}
 
-    def test_digest_auth(self):  # {{{
+    def test_digest_auth(self) -> None:  # {{{
         "Test HTTP Digest auth"
         from calibre.srv.http_request import normalize_header_name
         from calibre.srv.utils import parse_http_dict
@@ -217,7 +328,14 @@ class TestAuth(BaseTest):
         with TestServer(r.dispatch) as server:
             r.auth_controller.log = server.log
 
-            def test(conn, path, headers=None, status=http.client.OK, body=b'', request_body=b''):
+            def test(
+                conn: http.client.HTTPConnection,
+                path: str,
+                headers: dict[str, str | bytes] | None = None,
+                status: int = http.client.OK,
+                body: bytes = b'',
+                request_body: bytes = b'',
+            ) -> dict[str, str]:
                 if headers is None:
                     headers = {}
                 conn.request('GET', path, request_body, headers)
@@ -239,7 +357,7 @@ class TestAuth(BaseTest):
             args = auth.copy()
             args['un'], args['pw'], args['uri'] = 'testuser', 'testpw', '/closed'
 
-            def ok_test(conn, dh, **args):
+            def ok_test(conn: http.client.HTTPConnection, dh: bytes, **args: object) -> dict[str, str]:
                 args['body'] = args.get('body', b'closed')
                 return test(conn, '/closed', headers={'Authorization': dh}, **args)
 
@@ -258,7 +376,7 @@ class TestAuth(BaseTest):
             r.auth_controller.max_age_seconds = orig
             ok_test(conn, digest(**args))
 
-            def fail_test(conn, modify, **kw):
+            def fail_test(conn: http.client.HTTPConnection, modify: Callable[[DigestAuth], object], **kw: object) -> dict[str, str]:
                 kw['body'] = kw.get('body', b'')
                 kw['status'] = kw.get('status', http.client.UNAUTHORIZED)
                 args['modify'] = modify
@@ -287,7 +405,7 @@ class TestAuth(BaseTest):
             curl = shutil.which('curl')
             if curl and not (is_ci and ismacos):  # curl mysteriously returns b'' in CI with no errors
 
-                def docurl(data, *args):
+                def docurl(data: bytes, *args: str) -> None:
                     cmd = [curl, '--silent'] + list(args) + [f'http://localhost:{server.address[1]}/closed']
                     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     stdout, stderr = p.communicate()
@@ -301,14 +419,14 @@ class TestAuth(BaseTest):
 
     # }}}
 
-    def test_fail_ban(self):  # {{{
+    def test_fail_ban(self) -> None:  # {{{
         ban_for = 0.5 / 60.0
         r = router(prefer_basic_auth=True, ban_for=ban_for, ban_after=2)
         with TestServer(r.dispatch) as server:
             r.auth_controller.log = server.log
             conn = server.connect()
 
-            def request(un='testuser', pw='testpw'):
+            def request(un: str = 'testuser', pw: str = 'testpw') -> tuple[int, bytes]:
                 conn.request('GET', '/closed', headers={'Authorization': b'Basic ' + as_base64_bytes(f'{un}:{pw}')})
                 r = conn.getresponse()
                 return r.status, r.read()
@@ -325,7 +443,7 @@ class TestAuth(BaseTest):
 
     # }}}
 
-    def test_android_auth_workaround(self):  # {{{
+    def test_android_auth_workaround(self) -> None:  # {{{
         "Test authentication workaround for Android"
         r = router()
         with TestServer(r.dispatch) as server:
@@ -358,5 +476,51 @@ class TestAuth(BaseTest):
                 assert True, 'Replay attack succeeded'
             except HTTPError as e:
                 self.ae(e.code, http.client.UNAUTHORIZED)
+
+    def test_android_cookie_is_bound_to_user(self) -> None:
+        "Test that the android workaround cookie authenticates as the user it was issued to"
+        r = router()
+        ac = r.auth_controller
+        assert ac is not None
+        creds = ac.user_credentials
+        assert isinstance(creds, dict)
+        with TestServer(r.dispatch) as server:
+            ac.log = server.log
+            ac.max_age_seconds = 3600
+            url = f'http://localhost:{server.address[1]}/android-user'
+            auth_handler = HTTPDigestAuthHandler()
+            auth_handler.add_password(realm=REALM, uri=url, user='testuser', passwd='testpw')
+            cj = CookieJar()
+            cookie_handler = HTTPCookieProcessor(cj)
+            self.ae(build_opener(auth_handler, cookie_handler).open(url).read(), b'user:testuser')
+            cookie = tuple(cj)[0]
+            original_value = cookie.value
+            assert original_value is not None
+
+            def open_with_cookie(value: str) -> tuple[int, bytes]:
+                conn = server.connect()
+                conn.request('GET', '/android-user', headers={'Cookie': f'{ac.ANDROID_COOKIE}={value}'})
+                res = conn.getresponse()
+                return res.status, res.read()
+
+            # The cookie authenticates as the user it was issued to
+            self.ae(open_with_cookie(original_value), (http.client.OK, b'user:testuser'))
+            # Changing the username in the cookie invalidates it
+            nonce = original_value.rpartition(':')[0]
+            other_user = '!@#$%^&*()-=_+'
+            self.ae(open_with_cookie(f'{nonce}:{as_hex_unicode(other_user)}')[0], http.client.UNAUTHORIZED)
+            # Old style cookies without a username and garbage are rejected
+            self.ae(open_with_cookie(nonce)[0], http.client.UNAUTHORIZED)
+            self.ae(open_with_cookie(f'{nonce}:zz')[0], http.client.UNAUTHORIZED)
+            self.ae(open_with_cookie('')[0], http.client.UNAUTHORIZED)
+            # Changing the password of the user invalidates the cookie
+            creds['testuser'] = 'changed'
+            self.ae(open_with_cookie(original_value)[0], http.client.UNAUTHORIZED)
+            creds['testuser'] = 'testpw'
+            self.ae(open_with_cookie(original_value)[0], http.client.OK)
+            # Removing the user invalidates the cookie
+            del creds['testuser']
+            self.ae(open_with_cookie(original_value)[0], http.client.UNAUTHORIZED)
+            creds['testuser'] = 'testpw'
 
     # }}}

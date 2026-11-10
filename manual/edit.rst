@@ -372,6 +372,20 @@ Some of the checks performed are:
     * Various compatibility checks for known problems that can cause the book
       to malfunction on reader devices.
 
+    * Accessibility problems, based on the `EPUB Accessibility
+      <https://www.w3.org/TR/epub-a11y-11/>`_ specification. Images,
+      including SVG images, without alternative text, HTML files that do not
+      specify their language and headings that skip levels are reported. For
+      EPUB 3 books, missing accessibility metadata and elements whose
+      ``epub:type`` has a corresponding ARIA role, such as ``doc-noteref`` for
+      ``noteref``, but that do not have a ``role`` attribute, are also
+      reported. Screen readers rely on the ``role`` attribute, not
+      ``epub:type``. The language of the HTML files can be set automatically
+      to the language of the book and the missing roles can be added
+      automatically. These checks are only run if you turn on the
+      :guilabel:`Check for accessibility problems` option below the list of
+      problems.
+
 Adding a cover
 ^^^^^^^^^^^^^^^
 
@@ -492,6 +506,49 @@ special meaning. You can use them to identify the foreword, dedication, cover,
 table of contents, etc. Simply choose the type of semantic information you want
 to specify and then select the location in the book the link should point to.
 This tool can be accessed via :guilabel:`Tools->Set semantics`.
+
+Making the book accessible
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+This tool helps make the book accessible to readers with disabilities, such as
+people using screen readers. It can be accessed via
+:guilabel:`Tools->Accessibility` and has three tabs:
+
+:guilabel:`Language`
+    Set the languages of the book. Screen readers and text-to-speech engines
+    use the language to pronounce the text correctly. You can also set the
+    language of the HTML files in the book to the main language of the book,
+    either only for the files that do not specify a language or for all files.
+
+:guilabel:`Image descriptions`
+    Images should have a description, called *alternative text*, for readers
+    who cannot see them. This lists every image in the book, in reading order,
+    including SVG images inside the HTML files, along with its current
+    description, so you can add or change descriptions for all of them in one
+    place. The description of an SVG image is stored in its ``<title>``
+    element, or its ``aria-label`` attribute if it already has one. Selecting an image shows a larger preview
+    along with the text near the image in the book, to help you describe it.
+    Images that are purely decorative, such as ornaments and scene separators,
+    should be marked as :guilabel:`Decorative` so that screen readers skip
+    them. If the same image is used in several places, you can use the
+    :guilabel:`Use for all uses of this image` button to copy its description
+    to all of them.
+
+:guilabel:`Accessibility metadata`
+    EPUB 3 books can describe how accessible they are with accessibility
+    metadata, as required by the `EPUB Accessibility
+    <https://www.w3.org/TR/epub-a11y-11/>`_ specification. Reading systems and
+    online stores show this information to readers. Here you can set a short
+    summary of the accessibility of the book, the ways the content is
+    presented (text, images, audio, etc.), which of these are enough to
+    understand all of the content, accessibility features such as alternative
+    text for images or a page list, whether the book contains hazards such as
+    flashing content, and the accessibility standard the book conforms to.
+    Only claim what is actually true of the book.
+
+Only the things you actually change are written to the book, and all the
+changes can be undone together with the :guilabel:`Revert to` checkpoint that
+is created.
 
 Filtering style information
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -703,6 +760,62 @@ Spanish languages. You can install your own dictionaries via
 checker can use dictionaries from the LibreOffice program (in the .oxt
 format). You can download these dictionaries from
 `The LibreOffice Extensions repository <https://extensions.libreoffice.org/?Tags%5B%5D=50>`_.
+
+
+Checking the grammar of the book
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+As you edit HTML files, grammar, style and typography issues are underlined in
+the code view. Right click on an underlined issue to replace its text with one
+of the suggested corrections, ignore the issue for the current session, stop
+checking for that kind of issue altogether, or see an explanation of it.
+Hovering the mouse over an issue shows a description of it, and pressing
+:kbd:`Shift+F8` jumps to the next issue in the current file. Corrections are made only to the text, so
+formatting such as bold and italics is preserved. You can turn off the
+underlining in :guilabel:`Preferences->Editor settings`.
+
+You can see all the issues in the book with :guilabel:`Tools->Check grammar`
+(:kbd:`Shift+F7`). Select an issue to see an explanation of it and the
+suggested replacements, then click :guilabel:`Change` to correct it, or
+:guilabel:`Show in editor` to edit the text yourself. The list of issues can be
+filtered by text and by the type of issue. Issues can be ignored for the
+current session, and rules that find issues you are not interested in can be
+disabled, and enabled again with the :guilabel:`Manage disabled rules`
+button. The :guilabel:`Picky` option also checks for stylistic issues that are
+not errors, such as wordiness.
+
+Grammar checking works for many languages. As with spell checking, the
+language of the text comes from the book's metadata and ``lang`` attributes in
+the HTML files, so books with text in multiple languages are checked
+correctly. The data needed to check a language is downloaded the first time
+it is needed, either by right clicking in the editor and choosing to download
+it, or with the :guilabel:`Check grammar` tool.
+
+For English, there is also a :guilabel:`Deep check` option, which checks
+every sentence with a neural network as well. This finds errors that the
+rules miss, but is slower and needs the neural network to be downloaded. Once
+downloaded, the neural network is also used to put the best suggestions for
+corrections first.
+
+Suggestions for rewriting sentences
+#####################################
+
+For English text, a neural network can suggest rewrites of sentences, to fix
+grammar, make them more fluent or clearer, simpler or more formal, or to
+paraphrase them. Right click on a sentence and choose :guilabel:`Suggest
+rewrites for the sentence` (:kbd:`Ctrl+Shift+F8`) to see suggestions for it,
+or open the :guilabel:`View->Rewrite suggestions` panel to see suggestions for
+the sentence the cursor is in as you move around the text. The changes each
+suggestion makes are highlighted, click :guilabel:`Apply` to rewrite the
+sentence, preserving its formatting. You can choose which kinds of suggestions
+to show. Suggestions are also available in the :guilabel:`Check grammar` tool,
+for the sentence containing the selected issue.
+
+The neural network is downloaded the first time it is needed, it is large,
+about a gigabyte. Generating suggestions is faster on a GPU. By default the GPU
+is used if it is supported and faster than the CPU, in which case versions of
+the neural network for both are downloaded, you can change this in
+:guilabel:`Preferences->Editor settings`.
 
 
 Inserting special characters

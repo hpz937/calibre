@@ -1,7 +1,14 @@
 #!/usr/bin/env python
 # License: GPLv3 Copyright: 2017, Kovid Goyal <kovid at kovidgoyal.net>
 
+from typing import TYPE_CHECKING
+
 from calibre import my_unichr
+
+if TYPE_CHECKING:
+    import re
+    import unittest
+    from collections.abc import Collection, Mapping
 
 html5_entities = {
     # ENTITY_DATA {{{
@@ -2136,11 +2143,13 @@ html5_entities = {
 }
 
 
-def entity_to_unicode_in_python(match, exceptions=(), encoding='cp1252', result_exceptions=None):
+def entity_to_unicode_in_python(
+    match: re.Match[str], exceptions: Collection[str] = (), encoding: str | None = 'cp1252', result_exceptions: Mapping[str, str] | None = None
+) -> str:
     if result_exceptions is None:
         result_exceptions = {}
 
-    def check(ch):
+    def check(ch: str) -> str:
         return result_exceptions.get(ch, ch)
 
     ent = match.group(1)
@@ -2178,17 +2187,17 @@ def entity_to_unicode_in_python(match, exceptions=(), encoding='cp1252', result_
         return '&' + ent + ';'
 
 
-def find_tests():
+def find_tests() -> unittest.TestSuite:
     import unittest
 
     class TestHTMLEntityReplacement(unittest.TestCase):
-        def test_html_entity_replacement(self):
+        def test_html_entity_replacement(self) -> None:
             from calibre_extensions.fast_html_entities import replace_all_entities
 
-            def t(inp, exp):
+            def t(inp: str, exp: str) -> None:
                 self.assertEqual(exp, replace_all_entities(inp), f'Failed for input: {inp!r}')
 
-            def x(inp, exp):
+            def x(inp: str, exp: str) -> None:
                 self.assertEqual(exp, replace_all_entities(inp, True), f'Failed for input: {inp!r}')
 
             t('a&#1234;b', 'aӒb')
@@ -2205,10 +2214,29 @@ def find_tests():
             t('a&#1234;b', 'aӒb')
             t('a&#X1234;b', 'aሴb')
             t('a&#x1034fA;b', 'a\U001034fab')
-            t('a&#0;b&#x000;c', 'abc')
+            # NUL, surrogates and numbers beyond the last code point decode
+            # to U+FFFD, as in HTML5
+            t('a&#0;b&#x000;c', 'a\ufffdb\ufffdc')
+            t('&#0;', '\ufffd')
+            x('&#0;', '\ufffd')
+            t('a&#xD800;b&#55357;&#56832;c&#xDFFF;', 'a\ufffdb\ufffd\ufffdc\ufffd')
+            t('a&#x110000;b&#1114112;c&#x10FFFF;', 'a\ufffdb\ufffdc\U0010ffff')
+            self.assertEqual(b'a\xef\xbf\xbdb', replace_all_entities(b'a&#xD800;b'))
+            # Large numbers do not wrap around to a valid code point
+            t('&#4294967356;&#x10000003C;&#99999999999999999999;', '\ufffd\ufffd\ufffd')
+            x('&#4294967356;', '\ufffd')
+            x('&#60;&#x3c;', '&#60;&#x3c;')
+            # C1 controls decode as windows-1252, as in HTML5, except for the
+            # ones undefined in windows-1252
+            t('&#128;&#x80;&#150;&#x9f;&#127;&#160;', '\u20ac\u20ac\u2013\u0178\x7f\xa0')
+            t('&#x81;&#x8d;&#x8f;&#x90;&#x9d;', '\x81\x8d\x8f\x90\x9d')
+            for i in range(0x80, 0xA0):
+                exp = bytes((i,)).decode('cp1252', 'ignore') or chr(i)
+                t(f'&#{i};', exp)
+                self.assertEqual(exp.encode(), replace_all_entities(f'&#x{i:x};'.encode()))
             x('&amp;&lt;&gt;&apos;&quot;', '&amp;&lt;&gt;&apos;&quot;')
 
-        def test_html_entity_replacement_expanding(self):
+        def test_html_entity_replacement_expanding(self) -> None:
             # Some entities decode to more UTF-8 bytes than the entity itself
             from calibre_extensions.fast_html_entities import replace_all_entities
 
@@ -2230,7 +2258,7 @@ def find_tests():
     return unittest.defaultTestLoader.loadTestsFromTestCase(TestHTMLEntityReplacement)
 
 
-def generate_entity_lists():
+def generate_entity_lists() -> None:
     import re
     from html import entities as e
 
@@ -2246,7 +2274,7 @@ struct html_entity { const char *name, *val; }
 %%
 '''.splitlines()
 
-    def esc_for_c(x):
+    def esc_for_c(x: str) -> str:
         if x == '\n':
             return '\\n'
         if x in '''"\\''':
