@@ -13,6 +13,7 @@
 
 from bisect import bisect_right
 from collections.abc import Callable
+from dataclasses import replace
 from functools import partial
 from html import escape
 from itertools import count
@@ -67,9 +68,11 @@ from calibre.ai.cyoa import (
     adopt_turn,
     apply_character_edits,
     deserialize_game,
+    edit_last_turn,
     next_turn,
     npc_character_ids,
     quick_action_kind_name,
+    revise_last_turn,
     rewind,
     scene_image_prompt,
     serialize_game,
@@ -93,7 +96,7 @@ from calibre.gui2.cyoa.story_widgets import (
     scene_divider_image,
 )
 from calibre.gui2.cyoa.text_display import TextDisplay
-from calibre.gui2.cyoa.world_editor import EditWorldDialog
+from calibre.gui2.cyoa.world_editor import EditTurnDialog, EditWorldDialog
 from calibre.gui2.image_popup import ImagePopup
 from calibre.gui2.progress_indicator import WaitStack
 from calibre.gui2.widgets2 import Dialog
@@ -277,9 +280,10 @@ class GameWidget(QWidget):
         # rewinding while a turn is in-flight cannot corrupt the game.
         self.turn_counter = count(start=1)
         self.turn_call = -1
-        # What the in-flight turn generation was asked for, so that it can be
-        # retried if the turn times out or fails.
-        self.turn_request: tuple[str, bool] | None = None
+        # What the in-flight turn generation was asked for, as the arguments
+        # of request_turn(), so that it can be retried if the turn times out
+        # or fails.
+        self.turn_request: tuple[str, bool, str] | None = None
         # Set when the player edits the world while a turn is being written.
         # That turn is played on a copy of the game state taken before the
         # edits, so simply adopting the copy when the turn arrives would
@@ -361,6 +365,12 @@ class GameWidget(QWidget):
             _('Back to turn'),
             _('Go back to an earlier turn, discarding all turns after it, or restart the adventure. Press {} to go back one turn').format('Alt+Left'),
             self.back_to_turn,
+        )
+        self.edit_turn_action = toolbar_action(
+            'edit_input.png',
+            _('Edit turn'),
+            _('Correct the last turn, either by editing its text yourself or by having the AI write it again with a correction applied'),
+            self.edit_turn,
         )
         self.read_action = toolbar_action('view.png', _('Read'), _('Read the story so far, chapter by chapter, as a book'), self.read_story)
         self.world_action = toolbar_action(
@@ -472,6 +482,7 @@ class GameWidget(QWidget):
         a.triggered.connect(self.copy_current_turn)
         self.addAction(a)
         sv.copy_turn_action = a
+        sv.edit_turn_action = self.edit_turn_action
 
         # Ctrl+1, Ctrl+2, … activate the corresponding quick action link
         for i in range(MAX_QUICK_ACTION_SHORTCUTS):
@@ -617,8 +628,10 @@ class GameWidget(QWidget):
 
     def refresh_ui(self, scroll_to_last: bool = True) -> None:
         self.render_story()
-        # There is nothing to read until the opening turn has been written
-        self.read_action.setEnabled(self.state is not None and bool(self.state.turns))
+        # There is nothing to read or edit until the opening turn has been written
+        has_turns = self.state is not None and bool(self.state.turns)
+        self.read_action.setEnabled(has_turns)
+        self.edit_turn_action.setEnabled(has_turns)
         if scroll_to_last and self.state is not None and self.state.turns:
             self.scroll_to_turn(len(self.state.turns))
         self.update_window_title()
@@ -638,11 +651,15 @@ class GameWidget(QWidget):
             return
         c = sv.textCursor()
         c.movePosition(QTextCursor.MoveOperation.End)
-        if not state.turns:
+        # While the last turn is being written again, the new prose takes the
+        # place of the turn it replaces, see edit_turn().
+        revising = self.turn_call > -1 and self.turn_request is not None and bool(self.turn_request[2])
+        shown = replace(state, turns=state.turns[:-1]) if revising else state
+        if not shown.turns:
             insert_html_block(c, f'<h2>{escape(state.world.title)}</h2>')
             insert_html_block(c, response_to_html(state.world.world_description, ContentType.markdown))
         else:
-            self.turn_positions = render_chapter(c, state, state.current_chapter)
+            self.turn_positions = render_chapter(c, shown, state.current_chapter)
         if self.turn_call > -1 and self.turn_request is not None:
             # A turn is being generated: show the action the player took and
             # the prose the AI has written so far in place of the quick
@@ -1160,10 +1177,12 @@ class GameWidget(QWidget):
         self.turn_request = None
         self.discard_pending_turn_display()
         if should_retry[0]:
-            player_input, interesting_event = turn_request
-            self.request_turn(player_input, interesting_event)
+            self.request_turn(*turn_request)
 
-    def request_turn(self, player_input: str, interesting_event: bool = False) -> None:
+    def request_turn(self, player_input: str, interesting_event: bool = False, revision: str = '') -> None:
+        # When revision is given, the last turn, which answered player_input,
+        # is written again with it as the correction, rather than a new turn
+        # being played, see calibre.ai.cyoa.revise_last_turn().
         if self.state is None or self.turn_call > -1:
             return
         plugin = self.plugin_override or data.plugin_for('text')
@@ -1177,7 +1196,7 @@ class GameWidget(QWidget):
         # here on is one the copy does not have, see state_with_turn().
         self.world_edited_during_turn = False
         self.turn_call = next(self.turn_counter)
-        self.turn_request = (player_input, interesting_event)
+        self.turn_request = (player_input, interesting_event, revision)
         self.streamed_narrative = ''
         self._thinking_start = monotonic()
         self.input_stack.msg = _('Thinking…')
@@ -1196,9 +1215,11 @@ class GameWidget(QWidget):
         self.streaming_pin_value = -1
         if (vsb := self.story_view.verticalScrollBar()) is not None:
             vsb.setValue(vsb.maximum())
-        Thread(name='CYOATurn', daemon=True, target=self.do_turn, args=(snapshot, player_input, interesting_event, self.turn_call, plugin)).start()
+        Thread(
+            name='CYOATurn', daemon=True, target=self.do_turn, args=(snapshot, player_input, interesting_event, revision, self.turn_call, plugin)
+        ).start()
 
-    def do_turn(self, snapshot: GameState, player_input: str, interesting_event: bool, call_number: int, plugin: AIProvider) -> None:
+    def do_turn(self, snapshot: GameState, player_input: str, interesting_event: bool, revision: str, call_number: int, plugin: AIProvider) -> None:
         def on_narrative(text: str) -> None:
             if not sip.isdeleted(self):
                 self.turn_narrative_received.emit(call_number, text)
@@ -1206,7 +1227,10 @@ class GameWidget(QWidget):
         try:
             # the preferences overlay is thread local so must be entered here
             with data.cyoa_ai_settings():
-                res = next_turn(snapshot, player_input, plugin, interesting_event=interesting_event, on_narrative=on_narrative)
+                if revision:
+                    res = revise_last_turn(snapshot, revision, plugin, on_narrative=on_narrative)
+                else:
+                    res = next_turn(snapshot, player_input, plugin, interesting_event=interesting_event, on_narrative=on_narrative)
             if sip.isdeleted(self):
                 return
             self.turn_result_received.emit(call_number, snapshot, res)
@@ -1263,11 +1287,16 @@ class GameWidget(QWidget):
             retry_btn.clicked.connect(on_retry)
             d.exec()
             if should_retry[0] and turn_request is not None:
-                player_input, interesting_event = turn_request
-                self.request_turn(player_input, interesting_event)
+                self.request_turn(*turn_request)
             return
         chapter_before = self.state.current_chapter if self.state is not None else -1
-        self.state = state = self.state_with_turn(snapshot)
+        revised = turn_request is not None and bool(turn_request[2])
+        self.state = state = self.state_with_turn(snapshot, revised)
+        if revised:
+            # The picture of the turn that was replaced is of a scene that no
+            # longer happens, a new one is requested below if images are on.
+            self.images.pop(len(state.turns), None)
+            self.failed_image_turns.discard(len(state.turns))
         self.session_cost += res.cost
         was_streaming = bool(self.streamed_narrative)
         self.streamed_narrative = ''
@@ -1294,7 +1323,7 @@ class GameWidget(QWidget):
             self.request_image(len(state.turns))
         self._notify_turn_ready()
 
-    def state_with_turn(self, snapshot: GameState) -> GameState:
+    def state_with_turn(self, snapshot: GameState, revised: bool = False) -> GameState:
         # The game state to play on now that the turn written on snapshot, the
         # copy of the game state the turn was played on, has arrived. Normally
         # that copy simply becomes the game. When the player edited the world
@@ -1310,15 +1339,23 @@ class GameWidget(QWidget):
         self.world_edited_during_turn = False
         # Rewinding or loading a game discards the turn in flight, see
         # cancel_pending_ai_calls(), so the edited state holds exactly the
-        # turns the copy was made from, plus nothing.
-        if len(snapshot.turns) != len(state.turns) + 1:
+        # turns the copy was made from, plus nothing. When the turn was the
+        # last one written again, it takes the place of that one instead.
+        if len(snapshot.turns) != len(state.turns) + (0 if revised else 1):
             return snapshot
+        replaced = state.turns.pop() if revised else None
         try:
             adopt_turn(state, snapshot.turns[-1])
         except InvalidAIResponse:
             # The edited story memory cannot carry the turn, so the turn wins
             # over the edits: it is what the player has just read.
+            if replaced is not None:
+                state.turns.append(replaced)
             return snapshot
+        if replaced is not None:
+            # adopt_turn() places a turn by whether it starts a new chapter,
+            # but a revised turn stays in the chapter of the turn it replaces.
+            state.turns[-1] = state.turns[-1]._replace(chapter=replaced.chapter)
         return state
 
     def _notify_turn_ready(self) -> None:
@@ -1529,6 +1566,33 @@ class GameWidget(QWidget):
             _('Leave this game and return to the world creation screen? Any unsaved progress will be lost. Use the Save button to keep this game.'),
         ):
             self.game_abandoned.emit()
+
+    def edit_turn(self) -> None:
+        # Correct the last turn without going back and playing it again:
+        # either the player edits its prose directly or the AI writes it again
+        # with the player's correction applied.
+        state = self.state
+        if state is None or not state.turns:
+            return
+        if self.turn_call > -1:
+            # The turn being written is played on a copy of the game taken
+            # before any edit made now, which would be lost when it arrives.
+            self.status_bar.showMessage(_('Wait for the AI to finish writing the current turn before editing it.'), 5000)
+            return
+        last = state.turns[-1]
+        d = EditTurnDialog(last.turn, self)
+        if d.exec() != Dialog.DialogCode.Accepted:
+            return
+        if d.revision:
+            self.request_turn(last.player_input, revision=d.revision)
+            return
+        narrative, quick_actions = d.narrative, d.quick_actions
+        if narrative == last.turn.narrative and quick_actions == last.turn.quick_actions:
+            return
+        edit_last_turn(state, narrative, quick_actions)
+        self.autosave()
+        self.refresh_ui(scroll_to_last=False)
+        self.status_bar.showMessage(_('The edited turn will be used from the next turn'), 5000)
 
     def edit_world(self) -> None:
         state = self.state

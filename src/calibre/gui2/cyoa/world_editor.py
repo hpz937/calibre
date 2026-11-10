@@ -9,11 +9,13 @@ from threading import Thread
 from qt.core import (
     QFormLayout,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QIcon,
     QLabel,
     QListWidget,
     QPlainTextEdit,
+    QPushButton,
     QSize,
     Qt,
     QTabWidget,
@@ -32,8 +34,11 @@ from calibre.ai.cyoa import (
     CharacterState,
     GameState,
     PlayerCharacter,
+    QuickAction,
+    QuickActionKind,
     StoryStyle,
     StorySummary,
+    StoryTurn,
     clean_text_list,
 )
 from calibre.customize import AIProviderPlugin
@@ -199,6 +204,101 @@ class StoryMemoryEditor(QWidget):
             current_situation=self.current_situation_edit.markdown,
             upcoming_events=self.upcoming_events_edit.items,
         )
+
+
+class EditTurnDialog(Dialog):
+    # Corrects the last turn of the game, for when the AI got a detail wrong
+    # or took the story somewhere the player did not want it to go: either by
+    # editing its prose and quick actions directly, or by describing the
+    # correction and having the AI write the turn again. The prose is edited
+    # as the Markdown the AI wrote rather than as formatted text, so that the
+    # parts the player does not touch come back exactly as they were. The
+    # caller applies the result after the dialog is accepted: revision is the
+    # correction for the AI when the player chose that, empty otherwise, in
+    # which case narrative and quick_actions are the edited turn.
+
+    def __init__(self, turn: StoryTurn, parent: QWidget | None = None) -> None:
+        self.turn = turn
+        self.revision = ''
+        super().__init__(_('Edit turn'), 'cyoa-edit-turn', parent)
+
+    def sizeHint(self) -> QSize:
+        return QSize(800, 700)
+
+    def setup_ui(self) -> None:
+        l = QVBoxLayout(self)
+        la = QLabel(_('&Prose of the turn, in Markdown:'), self)
+        self.narrative_edit = ne = QPlainTextEdit(self)
+        ne.setPlainText(self.turn.narrative)
+        la.setBuddy(ne)
+        l.addWidget(la), l.addWidget(ne, stretch=10)
+        la = QLabel(_('&Quick actions, one per line:'), self)
+        self.actions_edit = ae = LineListEdit(self)
+        ae.load([a.text for a in self.turn.quick_actions])
+        ae.setMaximumHeight(ae.fontMetrics().lineSpacing() * 6)
+        la.setBuddy(ae)
+        l.addWidget(la), l.addWidget(ae)
+        la = QLabel(
+            _(
+                'The story memory was written by the AI from the original turn, so a detail fixed here may still be wrong there.'
+                ' Use "Edit world" to correct it.'
+            ),
+            self,
+        )
+        la.setWordWrap(True)
+        l.addWidget(la)
+
+        g = QGroupBox(_('Or have the AI write the turn again'), self)
+        gl = QVBoxLayout(g)
+        self.correction_edit = ce = QPlainTextEdit(g)
+        ce.setPlaceholderText(_('Describe what to change, for example: Mira has red hair, not blonde'))
+        ce.setMaximumHeight(ce.fontMetrics().lineSpacing() * 5)
+        gl.addWidget(ce)
+        h = QHBoxLayout()
+        b = QPushButton(QIcon.ic('view-refresh.png'), _('&Revise with AI'), g)
+        b.setToolTip(
+            '<p>'
+            + _(
+                'Have the AI write this turn again with the correction above applied, replacing it.'
+                ' The story memory is updated to match the new turn. This costs an AI call.'
+            )
+        )
+        b.clicked.connect(self.revise)
+        h.addStretch(), h.addWidget(b)
+        gl.addLayout(h)
+        l.addWidget(g)
+        l.addWidget(self.bb)
+        ne.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    @property
+    def narrative(self) -> str:
+        return self.narrative_edit.toPlainText().strip()
+
+    @property
+    def quick_actions(self) -> tuple[QuickAction, ...]:
+        # An action keeps the kind it had when its text is unchanged and
+        # otherwise takes the kind of the action that was on the same line, so
+        # that rewording an action does not lose its kind.
+        old = self.turn.quick_actions
+        kinds = {a.text.casefold(): a.kind for a in old}
+        return tuple(
+            QuickAction(text, kinds.get(text.casefold(), old[i].kind if i < len(old) else QuickActionKind.other))
+            for i, text in enumerate(self.actions_edit.items)
+        )
+
+    def revise(self) -> None:
+        if not (correction := self.correction_edit.toPlainText().strip()):
+            error_dialog(self, _('No correction'), _('Describe the correction you want the AI to make to this turn.'), show=True)
+            self.correction_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+            return
+        self.revision = correction
+        super().accept()
+
+    def accept(self) -> None:
+        if not self.narrative:
+            error_dialog(self, _('No prose'), _('The prose of the turn cannot be empty.'), show=True)
+            return
+        super().accept()
 
 
 class EditWorldDialog(Dialog):

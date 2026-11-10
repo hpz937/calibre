@@ -225,8 +225,8 @@ class SceneImageDisplay(QWidget):
 
 class StoryView(TextDisplayMixin, MomentumScrollMixin, QTextBrowser):
     # The chapter text display: a text browser with momentum scrolling,
-    # a line length limited to keep it comfortable to read and an extra
-    # context menu action to copy the current turn.
+    # a line length limited to keep it comfortable to read and extra
+    # context menu actions to copy the current turn and edit the last one.
 
     constrain_line_width = True
     extra_style_sheet = 'a { text-decoration: none }'  # quick action links are colored but not underlined
@@ -235,6 +235,7 @@ class StoryView(TextDisplayMixin, MomentumScrollMixin, QTextBrowser):
         super().__init__(parent)
         self.copy_turn_action: QAction | None = None
         self.copy_turn_text_only_action: QAction | None = None
+        self.edit_turn_action: QAction | None = None
         self.setup_text_display()
 
     def wheelEvent(self, a0: QWheelEvent | None) -> None:  # ty: ignore[invalid-method-override]
@@ -253,6 +254,8 @@ class StoryView(TextDisplayMixin, MomentumScrollMixin, QTextBrowser):
                 m.addAction(self.copy_turn_text_only_action)
             if self.copy_turn_action is not None:
                 m.addAction(self.copy_turn_action)
+        if self.edit_turn_action is not None and self.edit_turn_action.isEnabled():
+            m.addAction(self.edit_turn_action)
         m.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         m.exec(e.globalPos())
 

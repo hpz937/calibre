@@ -19,7 +19,7 @@
 import json
 import textwrap
 from collections.abc import Container, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, Protocol
 
@@ -538,6 +538,32 @@ def rewind(state: GameState, num_of_turns: int = 1) -> None:
     if not 0 < num_of_turns <= len(state.turns):
         raise ValueError(f'Cannot rewind {num_of_turns} turns in a game with {len(state.turns)} turns')
     del state.turns[-num_of_turns:]
+
+
+def edit_last_turn(state: GameState, narrative: str, quick_actions: Iterable[QuickAction] | None = None) -> None:
+    # Replace the prose, and optionally the quick actions, of the last turn
+    # with the player's corrected versions. The prose of the turns is what the
+    # AI is sent as the story so far, see turn_prompt(), so the next turn
+    # continues from the corrected passage. The summary of the turn is left
+    # as it is: the AI derived it from the passage it wrote, so a detail it
+    # recorded there wrongly is fixed by editing the story memory, see
+    # calibre.gui2.cyoa.world_editor.EditWorldDialog. Blank and duplicate quick
+    # actions are discarded, None keeps the quick actions the turn has.
+    if not state.turns:
+        raise ValueError('Cannot edit the last turn of a game with no turns')
+    if not (narrative := narrative.strip()):
+        raise ValueError('The prose of a turn cannot be empty')
+    t = state.turns[-1]
+    turn = t.turn._replace(narrative=narrative)
+    if quick_actions is not None:
+        actions: list[QuickAction] = []
+        seen: set[str] = set()
+        for a in quick_actions:
+            if (text := a.text.strip()) and (key := text.casefold()) not in seen:
+                seen.add(key)
+                actions.append(a._replace(text=text))
+        turn = turn._replace(quick_actions=tuple(actions))
+    state.turns[-1] = t._replace(turn=turn)
 
 
 def apply_character_edits(state: GameState, edits: Mapping[str, CharacterState], player: PlayerCharacter | None = None) -> None:
@@ -1127,6 +1153,28 @@ def turn_prompt(state: GameState, player_input: str = '', interesting_event: boo
     return '\n'.join(parts)
 
 
+def revision_prompt(state: GameState, correction: str) -> str:
+    # The prompt asking the AI to write the last turn of state again with the
+    # player's correction applied. It is the prompt the turn was written from,
+    # built from the game as it stood before the turn, followed by the passage
+    # the AI wrote then and the correction, so that the AI rewrites the passage
+    # rather than starting over.
+    old = state.turns[-1]
+    before = replace(state, turns=state.turns[:-1])
+    parts = [
+        turn_prompt(before, old.player_input),
+        '',
+        'You have already written this passage, but the reader found a mistake in it:',
+        '',
+        old.turn.narrative,
+        '',
+        f'The reader asks for this correction: {correction}',
+        'Write the passage again with the correction applied, keeping everything else as close to the original as you can.'
+        ' Every other field of your response must match the corrected passage.',
+    ]
+    return '\n'.join(parts)
+
+
 # }}}
 
 
@@ -1475,10 +1523,67 @@ def next_turn(
         player_input = ''
     instructions = turn_instructions(state)
     prompt = turn_prompt(state, player_input, interesting_event)
+    res, record = generated_turn(state, instructions, prompt, plugin, use_model, on_narrative)
+    if record is None:
+        return res
+    chapter = state.current_chapter
+    if state.turns and record.turn.starts_new_chapter:
+        chapter += 1
+    state.turns.append(record._replace(player_input=player_input, chapter=chapter))
+    return res
+
+
+def revise_last_turn(
+    state: GameState,
+    correction: str,
+    plugin: AIProvider | None = None,
+    use_model: str = '',
+    on_narrative: OnText | None = None,
+) -> StructuredOutputResult:
+    # Have the AI write the last turn again with the player's correction
+    # applied, replacing it, for when the AI got a detail wrong or took the
+    # story somewhere the player did not want it to go, see revision_prompt().
+    # The turn is written as it was the first time, from the game as it stood
+    # before it, so its summary update is merged into the summary of the turn
+    # before it, not stacked on top of the update being replaced. The turn
+    # keeps the player input it answered and the chapter it is in, as a
+    # correction must not move it into a chapter of its own. Results, errors
+    # and on_narrative are as for next_turn().
+    if not state.turns:
+        raise ValueError('Cannot revise the last turn of a game with no turns')
+    plugin = plugin or default_provider()
+    if plugin is None:
+        return no_provider_error()
+    old = state.turns[-1]
+    before = replace(state, turns=state.turns[:-1])
+    instructions = turn_instructions(before)
+    prompt = revision_prompt(state, correction)
+    res, record = generated_turn(before, instructions, prompt, plugin, use_model, on_narrative)
+    if record is None:
+        return res
+    # Whether the turn opens its chapter, and the title of the chapter, are
+    # those of the turn being replaced, though the AI may retitle a chapter
+    # the turn opens.
+    turn = record.turn._replace(
+        starts_new_chapter=old.turn.starts_new_chapter,
+        chapter_title=(record.turn.chapter_title or old.turn.chapter_title) if old.turn.starts_new_chapter else old.turn.chapter_title,
+    )
+    state.turns[-1] = record._replace(player_input=old.player_input, chapter=old.chapter, turn=turn)
+    return res._replace(data=turn)
+
+
+def generated_turn(
+    state: GameState, instructions: str, prompt: str, plugin: AIProvider, use_model: str, on_narrative: OnText | None
+) -> tuple[StructuredOutputResult, TurnRecord | None]:
+    # Have the AI write a turn following on from state, returning the result
+    # and the record of the turn, with the summary update of the turn merged
+    # into the summary of state. The player input and chapter of the record
+    # are for the caller to fill in. The record is None when the AI failed or
+    # its response was unusable, in which case the result reports the error.
     on_text = narrative_streamer(on_narrative) if on_narrative is not None else None
     res = plugin.generate_structured_output(prompt, StoryTurn, instructions, use_model, on_text)
     if res.exception is not None:
-        return res
+        return res, None
     turn = res.data
     try:
         if not isinstance(turn, StoryTurn):
@@ -1486,26 +1591,21 @@ def next_turn(
         turn = validated_turn(turn)
         summary = updated_summary(turn.summary_update, state.current_summary)
     except InvalidAIResponse as e:
-        return validation_error(res, e)
-    chapter = state.current_chapter
-    if state.turns and turn.starts_new_chapter:
-        chapter += 1
-    state.turns.append(
-        TurnRecord(
-            player_input=player_input,
-            raw_response=res.raw,
-            turn=turn,
-            summary=summary,
-            chapter=chapter,
-            cost=res.cost,
-            currency=res.currency,
-            provider=res.provider,
-            model=res.model,
-            instructions=instructions if STORE_PROMPTS_IN_TURN_RECORDS else '',
-            prompt=prompt if STORE_PROMPTS_IN_TURN_RECORDS else '',
-        )
+        return validation_error(res, e), None
+    record = TurnRecord(
+        player_input='',
+        raw_response=res.raw,
+        turn=turn,
+        summary=summary,
+        chapter=0,
+        cost=res.cost,
+        currency=res.currency,
+        provider=res.provider,
+        model=res.model,
+        instructions=instructions if STORE_PROMPTS_IN_TURN_RECORDS else '',
+        prompt=prompt if STORE_PROMPTS_IN_TURN_RECORDS else '',
     )
-    return res._replace(data=turn)
+    return res._replace(data=turn), record
 
 
 def adopt_turn(state: GameState, record: TurnRecord) -> None:
@@ -2195,6 +2295,66 @@ def find_tests() -> TestSuite:  # {{{
             self.assertRaises(ValueError, rewind, state, 0)
             rewind(state)
             self.ae(state.current_summary, initial_summary(state.world, state.character))
+
+        def test_ai_cyoa_edit_last_turn(self) -> None:
+            state = start_game('brief', make_world())
+            self.assertRaises(ValueError, edit_last_turn, state, 'Nothing to edit.')
+            fake = FakePlugin([ok(make_turn('Mira tosses her blonde hair.', 'met mira')), ok(make_turn('She smiles.'))])
+            next_turn(state, '', fake)
+            summary = state.current_summary
+            actions = state.turns[-1].turn.quick_actions
+            edit_last_turn(state, '  Mira tosses her red hair.\n')
+            self.ae(state.turns[-1].turn.narrative, 'Mira tosses her red hair.')
+            self.ae(state.turns[-1].turn.quick_actions, actions, 'quick actions not passed are kept')
+            self.ae(state.current_summary, summary, 'the summary is not touched by editing the prose')
+            edit_last_turn(state, 'Mira tosses her red hair.', (QuickAction(' Ask Mira '), QuickAction(''), QuickAction('ask mira'), actions[1]))
+            self.ae(state.turns[-1].turn.quick_actions, (QuickAction('Ask Mira'), actions[1]))
+            self.assertRaises(ValueError, edit_last_turn, state, '  ')
+            self.ae(state.turns[-1].turn.narrative, 'Mira tosses her red hair.')
+            prompt = turn_prompt(state, 'wave')
+            self.assertIn('red hair', prompt, 'the AI continues from the edited prose')
+            self.assertNotIn('blonde', prompt)
+            self.ae(deserialize_game(serialize_game(state)).turns, state.turns)
+            next_turn(state, 'wave', fake)
+            self.assertIn('red hair', fake.calls[-1][0])
+
+        def test_ai_cyoa_revise_last_turn(self) -> None:
+            state = start_game('brief', make_world())
+            fake = FakePlugin([
+                ok(make_turn('One.', 'one')),
+                ok(make_turn('Mira tosses her blonde hair.', 'met blonde mira', starts_new_chapter=True, chapter_title='Mira')),
+                ok(make_turn('Mira tosses her red hair.', 'met red mira')),
+            ])
+            next_turn(state, '', fake)
+            next_turn(state, 'look for Mira', fake)
+            before = state.turns[0].summary
+            original = state.turns[-1]
+            res = revise_last_turn(state, 'Mira has red hair', fake)
+            self.assertIsNone(res.exception)
+            prompt = fake.calls[-1][0]
+            self.assertIn('Mira tosses her blonde hair.', prompt, 'the AI is shown the passage it is revising')
+            self.assertIn('Mira has red hair', prompt)
+            self.assertIn('look for Mira', prompt, 'the AI is shown the direction the turn answered')
+            self.ae(len(state.turns), 2)
+            revised = state.turns[-1]
+            self.ae(revised.turn.narrative, 'Mira tosses her red hair.')
+            self.ae(revised.player_input, original.player_input)
+            self.ae(revised.chapter, original.chapter, 'a revision does not move the turn to another chapter')
+            self.ae(state.chapter_titles, ('Chapter 1', 'Mira'))
+            self.ae(revised.summary.major_events, before.major_events + ('met red mira',), 'the update is merged into the summary of the turn before')
+            # Failures leave the game untouched
+            fake = FakePlugin([StructuredOutputResult(exception=ValueError('boom'))])
+            res = revise_last_turn(state, 'anything', fake)
+            self.assertIsNotNone(res.exception)
+            self.ae(state.turns[-1], revised)
+            # The opening turn can be revised as well
+            rewind(state)
+            fake = FakePlugin([ok(make_turn('Uno.', 'uno'))])
+            revise_last_turn(state, 'In Spanish', fake)
+            self.ae(len(state.turns), 1)
+            self.ae(state.turns[0].turn.narrative, 'Uno.')
+            self.ae(state.current_summary.major_events, ('uno',))
+            self.assertIn('Begin the novel', fake.calls[-1][0])
 
         def test_ai_cyoa_character_edits(self) -> None:
             # Editing a character changes who they are for the whole story,
